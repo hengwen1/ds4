@@ -35,6 +35,12 @@
 #define CUDA_QK_K 256
 #define DS4_CUDA_UNUSED __attribute__((unused))
 
+/* Mirrors the DS4_GLM_MOE_PATH_* values declared in ds4_gpu.h; this file does
+ * not include the public header (pre-existing convention). */
+#define DS4_GLM_MOE_PATH_NONE    0
+#define DS4_GLM_MOE_PATH_TYPED   1
+#define DS4_GLM_MOE_PATH_GENERIC 2
+
 enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
      * compressed scores in shared memory.  The host routes larger unmasked
@@ -34481,6 +34487,28 @@ static int glm_routed_moe_finish_batch(
     return cuda_ok(cudaMemcpyAsync(out->ptr, out_work, out_bytes,
                                    cudaMemcpyDeviceToDevice, 0),
                    "glm routed moe local output copy");
+}
+
+/* The typed GLM expert kernels above are Q2_K-only (uniform gate/up/down).
+ * The generic routed MoE covers the Q4_K gate/up/down sets and the IQ2_XXS
+ * gate/up with Q2_K down and MXFP4 sets, and the GLM SwiGLU clamp is passed
+ * through to it, so those layers run there instead of failing the typed
+ * entry point. Anything else stays on the typed path, which reports the
+ * unsupported types. */
+extern "C" int ds4_gpu_glm_routed_moe_path(
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type) {
+    if (gate_type == 10u && up_type == 10u && down_type == 10u) {
+        return DS4_GLM_MOE_PATH_TYPED;                 /* Q2_K experts */
+    }
+    if (gate_type != up_type) return DS4_GLM_MOE_PATH_NONE;
+    if ((gate_type == 12u && down_type == 12u) ||      /* Q4_K experts */
+        (gate_type == 16u && down_type == 10u) ||      /* IQ2_XXS + Q2_K */
+        (gate_type == 39u && down_type == 39u)) {      /* MXFP4 experts */
+        return DS4_GLM_MOE_PATH_GENERIC;
+    }
+    return DS4_GLM_MOE_PATH_NONE;
 }
 
 extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(

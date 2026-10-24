@@ -93,6 +93,24 @@ The Spark instructions apply unchanged: Q2 needs SSD streaming on a single
   --ssd-streaming --ctx 32768
 ```
 
+## GLM 5.3 Flash Q4
+
+The 178 GiB Q4 file also runs here, through the same type routing as on Spark:
+the Q4_K routed experts take the generic routed MoE (`12/12/12` expert layers),
+not the CUDA GLM kernels, which are Q2_K-only. Size the expert cache explicitly;
+the automatic one is about 1 GiB on a 128 GB machine and leaves the run I/O
+bound.
+
+```sh
+./ds4 -m gguf/GLM-5.3-Flash-Q4_K.gguf --ssd-streaming \
+  --ssd-streaming-cache-experts 32GB --ctx 65536
+```
+
+Verified on one Thor (122 GB pool, 191 GB file on local NVMe) with a 24 GiB
+expert cache: 1.6 t/s prefill and 1.4-1.9 t/s decode at 8K context, and correct,
+coherent answers. Those numbers measure the SSD hit rate, not the GPU: GLM is
+disk-bound at this cache size on a module that cannot hold the file.
+
 ## Testing
 
 Model-free checks that cover the Thor-specific code:

@@ -5193,6 +5193,19 @@ static int glm_rocm_routed_moe_wrap(
                                            force_resident);
 }
 
+/* The ROCm GLM entry point forwards to this build's generic routed MoE, so
+ * every expert set the routed kernels quantize is already handled there and
+ * nothing has to be rerouted. */
+extern "C" int ds4_gpu_glm_routed_moe_path(
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type) {
+    (void)gate_type;
+    (void)up_type;
+    (void)down_type;
+    return DS4_GLM_MOE_PATH_TYPED;
+}
+
 extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *mid,

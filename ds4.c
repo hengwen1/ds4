@@ -47030,11 +47030,23 @@ static bool glm_graph_dense_tensor_layout(
 
 static bool glm_graph_layer_uses_generic_routed_moe(
         const ds4_layer_weights *l) {
-    return l &&
-           l->ffn_gate_exps &&
-           l->ffn_up_exps &&
-           l->ffn_down_exps &&
-           l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS;
+    if (!l ||
+        !l->ffn_gate_exps ||
+        !l->ffn_up_exps ||
+        !l->ffn_down_exps) {
+        return false;
+    }
+    /* IQ2_XXS gate/up experts have always run on the generic routed MoE: the
+     * typed GLM expert kernels are Q2_K-oriented on every backend. */
+    if (l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS) return true;
+    /* Otherwise the typed path is preferred where it exists, and a backend
+     * whose typed kernels do not cover this expert set (CUDA is Q2_K-only, so
+     * Q4_K experts land here) gets the generic routed MoE, which applies the
+     * same GLM SwiGLU clamp. */
+    return ds4_gpu_glm_routed_moe_path(l->ffn_gate_exps->type,
+                                       l->ffn_up_exps->type,
+                                       l->ffn_down_exps->type) ==
+           DS4_GLM_MOE_PATH_GENERIC;
 }
 
 static bool glm_tp_validate_ownership_kernels(

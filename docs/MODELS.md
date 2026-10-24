@@ -184,6 +184,18 @@ GLM 5.3 Flash has recurrent KDA layers, sparse DSA attention, hyper-connections,
 and a built-in MTP block. The Q2 file uses imatrix-guided IQ2_XXS gate/up and
 Q2_K down experts. Q4 is the higher-precision alternative.
 
+Which routed-expert kernel a layer runs is decided per expert type set. CUDA's
+hand-written GLM expert kernels are Q2_K-only, so Q4_K expert layers (the Q4
+files) run on the generic routed MoE, which applies the same GLM SwiGLU clamp.
+That is a different kernel, not a different model: same weights, same math.
+The Q4 file needs SSD streaming on a 128 GB machine:
+
+```sh
+./download_model.sh glm53-q4
+./ds4 -m gguf/GLM-5.3-Flash-Q4_K.gguf --ssd-streaming \
+  --ssd-streaming-cache-experts 32GB --ctx 8192
+```
+
 Q2 is close enough to a 128 GB machine's memory budget that other workloads
 and context size matter. Follow the [Metal](METAL.md), [Spark](DGX_SPARK.md),
 or [Strix Halo](STRIX_HALO.md) starting configuration for your host.

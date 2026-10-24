@@ -2748,6 +2748,19 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         uint32_t                mid_token_stride);
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
+
+/* Which routed-MoE implementation the GLM graph should use for a layer whose
+ * experts are (gate, up, down). The typed GLM kernels are hand-written per
+ * backend and per quant; the generic routed MoE (the DeepSeek path) is slower
+ * on some backends but accepts the Q4_K/Q8_0/IQ2_XXS/MXFP4 expert sets and
+ * applies the same GLM SwiGLU clamp. A layer the typed kernels cannot run is
+ * routed to the generic path when the backend supports its expert set there,
+ * and left on the typed path (which reports the unsupported types) otherwise. */
+#define DS4_GLM_MOE_PATH_NONE    0
+#define DS4_GLM_MOE_PATH_TYPED   1
+#define DS4_GLM_MOE_PATH_GENERIC 2
+int ds4_gpu_glm_routed_moe_path(uint32_t gate_type, uint32_t up_type, uint32_t down_type);
+
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_dspark_gfx1151_fast_path(void);

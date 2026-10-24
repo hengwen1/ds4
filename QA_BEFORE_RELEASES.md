@@ -977,10 +977,16 @@ Do not use high-performance Hugging Face Xet mode while a model is resident.
   single-GPU fallback without creating peer-only TP/EP state. The eight-GPU
   native oracle is not a valid Spark test because its topology is intentionally
   unavailable there.
-- For GLM 5.3, use the resident Q2 artifact only. Require the dedicated CUDA
-  primitive and continuation gates in section 6, then record prefill,
-  generation, MTP, continued-prefill, server aggregate throughput, and peak
-  memory. Do not attempt the 178 GiB Q4 artifact on one 128 GB Spark.
+- For GLM 5.3, use the resident Q2 artifact as the default. Require the
+  dedicated CUDA primitive and continuation gates in section 6, then record
+  prefill, generation, MTP, continued-prefill, server aggregate throughput,
+  and peak memory. Do not attempt the 178 GiB Q4 artifact resident on one
+  128 GB Spark; with `--ssd-streaming` and an explicit
+  `--ssd-streaming-cache-experts` budget it does run, and its Q4_K expert
+  layers must take the generic routed MoE rather than the Q2_K-only typed
+  kernels. A `glm routed moe: unsupported types 12/12/12` line means the
+  type routing regressed. Check answer coherence and record the speed with
+  the cache size, since the run is disk-bound.
 - If CUDA Q4, distributed, streaming hooks, tensor span loading, or model cache
   code changed, test the specific GGUF and split mode that uses that path.
 - Verify that any CUDA-only warning fixes are also clean on macOS and do not
@@ -1008,6 +1014,14 @@ and run gates:
   than the fp16 scorer on the prefill-shaped rows (32..2048 tokens). Report
   clocks and any other resident service: this module ramps clocks and the
   first measurement after idle is slower.
+- Run a GLM Q4_K smoke after changing routed-expert type dispatch: prefill a
+  short prompt and a few greedy tokens with `--ssd-streaming` (the 178 GiB file
+  does not fit). The experts must stay on the generic routed MoE -- a
+  `glm routed moe: unsupported types 12/12/12` line means the layer was sent
+  back to the Q2_K-only CUDA kernels. Answer coherence is the cheap check that
+  the SwiGLU clamp and expert math survived the reroute; compare a 32-token
+  greedy continuation before and after the change when touching
+  `glm_graph_layer_uses_generic_routed_moe`.
 - Run one resident Flash Q2 CLI prompt and `tests/test_deepseek_indexer` as in
   the Spark section. There are no Thor whole-model speed baselines yet; record
   what you measure and say it is new, do not reuse Spark numbers.

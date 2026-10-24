@@ -38075,6 +38075,20 @@ static bool ds4_gpu_glm_down_type_supported(uint32_t down_type) {
            down_type == DS4_METAL_TENSOR_Q6_K;
 }
 
+/* The typed Metal GLM expert kernels cover Q2_K/Q4_K/Q5_K gate pairs and
+ * Q2_K/Q4_K/Q5_K/Q6_K down projections; everything else is left to the
+ * caller's generic-path decision. */
+int ds4_gpu_glm_routed_moe_path(
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type) {
+    if (ds4_gpu_glm_gate_pair_type_supported(gate_type, up_type) &&
+        ds4_gpu_glm_down_type_supported(down_type)) {
+        return DS4_GLM_MOE_PATH_TYPED;
+    }
+    return DS4_GLM_MOE_PATH_NONE;
+}
+
 int ds4_gpu_glm_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,

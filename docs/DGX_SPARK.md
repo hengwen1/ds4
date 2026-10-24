@@ -133,8 +133,21 @@ Q2 is the resident target for one Spark:
 ./ds4 --cuda -m gguf/GLM-5.3-Flash-Q2.gguf --ctx 16384
 ```
 
-Q4 does not fit resident. GLM Spark-to-Spark tensor parallelism is not
-implemented; the two-Mac RDMA instructions do not apply to GLM on CUDA.
+Q4 does not fit resident, but it does run with SSD streaming. Its Q4_K expert
+layers take the
+[generic routed MoE instead of the Q2_K GLM kernels](MODELS.md#glm-53-flash):
+
+```sh
+./download_model.sh glm53-q4
+./ds4 --cuda -m gguf/GLM-5.3-Flash-Q4_K.gguf --ssd-streaming \
+  --ssd-streaming-cache-experts 32GB --ctx 8192
+```
+
+Give that cache as much of the remaining memory as possible: the 178 GiB file
+streams from disk, so speed tracks the hit rate. The automatic cache size on a
+128 GB machine is on the order of 1 GiB, which leaves prefill and decode I/O
+bound. GLM Spark-to-Spark tensor parallelism is not implemented; the two-Mac
+RDMA instructions do not apply to GLM on CUDA.
 
 ## Vision and speculative decoding
 
