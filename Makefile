@@ -41,9 +41,15 @@ NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
 ifneq ($(filter sm_120 sm_120a,$(strip $(CUDA_ARCH))),)
+# RTX 50 / RTX PRO Blackwell: block-scaled MXFP4 via mma.sync.
 NVCC_ARCH_FLAGS := -gencode arch=compute_120a,code=sm_120a -DDS4_CUDA_HAVE_MXF4=1
 else ifneq ($(filter sm_121 sm_121a,$(strip $(CUDA_ARCH))),)
+# DGX Spark / GB10: same block-scaled MXFP4 mma.sync instructions.
 NVCC_ARCH_FLAGS := -gencode arch=compute_121a,code=sm_121a -DDS4_CUDA_HAVE_MXF4=1
+else ifneq ($(filter sm_110 sm_110a,$(strip $(CUDA_ARCH))),)
+# Jetson Thor: the mxf4 mma.sync form does not exist here; the block-scaled
+# MXFP4 path is written against tcgen05 (see ds4_cuda.cu).
+NVCC_ARCH_FLAGS := -gencode arch=compute_110a,code=sm_110a -DDS4_CUDA_HAVE_TCGEN05=1
 else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
@@ -69,7 +75,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-thor cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench check-mxfp4-half-lut
@@ -289,7 +295,8 @@ all: help
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
+	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10 (sm_121a)"
+	@echo "  make cuda-thor           Build CUDA for Jetson Thor (sm_110a, tcgen05)"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
@@ -305,13 +312,16 @@ help:
 cuda-spark:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_121
 
+cuda-thor:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_110a
+
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
 
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
 		echo "error: specify CUDA_ARCH, for example: make cuda CUDA_ARCH=sm_120"; \
-		echo "       or use make cuda-spark / make cuda-generic"; \
+		echo "       or use make cuda-spark / make cuda-thor / make cuda-generic"; \
 		exit 2; \
 	fi
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
@@ -492,6 +502,16 @@ tests/test_cuda_indexer: tests/test_cuda_indexer.o ds4_cuda.o ds4_image.o $(MMQ_
 .PHONY: test-cuda-indexer
 test-cuda-indexer: tests/test_cuda_indexer
 	./tests/test_cuda_indexer
+
+tests/test_cuda_indexer_mxfp4.o: tests/test_cuda_indexer_mxfp4.cu ds4_gpu.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
+
+tests/test_cuda_indexer_mxfp4: tests/test_cuda_indexer_mxfp4.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-cuda-indexer-mxfp4
+test-cuda-indexer-mxfp4: tests/test_cuda_indexer_mxfp4
+	./tests/test_cuda_indexer_mxfp4
 
 tests/test_cuda_f16_chunks.o: tests/test_cuda_f16_chunks.cu ds4_gpu.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<

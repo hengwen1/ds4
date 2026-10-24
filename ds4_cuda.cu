@@ -285,7 +285,21 @@ static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+/* Platform of the compute devices, decided once from the device properties at
+ * init (see cuda_platform_probe). Spark is the DGX Spark / GB10 (integrated,
+ * capability 12.1, sm_121a); Thor is the Jetson Thor (capability 11.0,
+ * sm_110a). The two Blackwell variants expose different instruction sets --
+ * block-scaled MXFP4 is mma.sync on sm_121a and tcgen05 on sm_110a -- so the
+ * quantized fast paths are selected per platform rather than by "Blackwell". */
+typedef enum {
+    DS4_CUDA_PLATFORM_GENERIC = 0,
+    DS4_CUDA_PLATFORM_SPARK,
+    DS4_CUDA_PLATFORM_THOR,
+} ds4_cuda_platform;
+
+static ds4_cuda_platform g_device_platform = DS4_CUDA_PLATFORM_GENERIC;
 static bool g_device_is_spark = false;
+static bool g_device_is_thor = false;
 static struct {
     cudaMemPool_t pool;
     uint64_t previous;
@@ -317,6 +331,40 @@ static void cuda_scratch_retention_cleanup(int tier) {
 
 extern "C" int ds4_gpu_device_is_spark(void) {
     return g_n_gpus == 1 && g_device_is_spark;
+}
+
+extern "C" int ds4_gpu_device_is_thor(void) {
+    return g_n_gpus >= 1 && g_device_is_thor;
+}
+
+static const char *cuda_platform_name(ds4_cuda_platform platform) {
+    switch (platform) {
+        case DS4_CUDA_PLATFORM_SPARK: return "DGX Spark (GB10)";
+        case DS4_CUDA_PLATFORM_THOR:  return "Jetson Thor";
+        default:                      return "generic CUDA";
+    }
+}
+
+/* Resolve the platform from the first device's properties. DS4_CUDA_PLATFORM
+ * forces one for testing (spark / thor / generic); it never turns on a kernel
+ * the hardware cannot run, the dispatch sites still check the capability. */
+static void cuda_platform_probe(const cudaDeviceProp *prop) {
+    ds4_cuda_platform platform = DS4_CUDA_PLATFORM_GENERIC;
+    if (prop->integrated && prop->major == 12 && prop->minor == 1) {
+        platform = DS4_CUDA_PLATFORM_SPARK;
+    } else if (prop->major == 11) {
+        platform = DS4_CUDA_PLATFORM_THOR;
+    }
+    const char *env = getenv("DS4_CUDA_PLATFORM");
+    if (env && env[0]) {
+        if (strcmp(env, "spark") == 0) platform = DS4_CUDA_PLATFORM_SPARK;
+        else if (strcmp(env, "thor") == 0) platform = DS4_CUDA_PLATFORM_THOR;
+        else if (strcmp(env, "generic") == 0) platform = DS4_CUDA_PLATFORM_GENERIC;
+        else fprintf(stderr, "ds4: DS4_CUDA_PLATFORM=%s ignored (spark|thor|generic)\n", env);
+    }
+    g_device_platform = platform;
+    g_device_is_spark = platform == DS4_CUDA_PLATFORM_SPARK;
+    g_device_is_thor  = platform == DS4_CUDA_PLATFORM_THOR;
 }
 
 /* Per-pair pinned-host bounce buffers, indexed [src][dst]. Lazily grown
@@ -533,7 +581,7 @@ static uint64_t g_cuda_tmp_bytes;
 static void *g_tt_scratch;
 static uint64_t g_tt_scratch_bytes;
 static int g_tt_scratch_device = -1;
-#ifdef DS4_CUDA_HAVE_MXF4
+#if defined(DS4_CUDA_HAVE_MXF4) || defined(DS4_CUDA_HAVE_TCGEN05)
 static void *g_indexer_mxf4_scratch;
 static uint64_t g_indexer_mxf4_scratch_bytes;
 static int g_indexer_mxf4_scratch_device = -1;
@@ -2769,10 +2817,19 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         cuda_scratch_retention_init(i);
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
-            if (i == 0) g_device_is_spark =
-                prop.integrated && prop.major == 12 && prop.minor == 1;
+            if (i == 0) cuda_platform_probe(&prop);
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
+            if (i == 0 && g_device_platform != DS4_CUDA_PLATFORM_GENERIC) {
+                const char *kernels =
+#ifdef DS4_CUDA_HAVE_TCGEN05
+                    g_device_is_thor ? ", tcgen05 kernels compiled in" : "";
+#else
+                    g_device_is_thor ? ", built without tcgen05 (generic kernels)" : "";
+#endif
+                fprintf(stderr, "ds4: CUDA platform: %s%s\n",
+                        cuda_platform_name(g_device_platform), kernels);
+            }
         }
         /* Per-device stream. */
         cudaStream_t s = NULL;
@@ -2986,7 +3043,7 @@ extern "C" void ds4_gpu_cleanup(void) {
             g_tt_scratch_bytes = 0;
             g_tt_scratch_device = -1;
         }
-#ifdef DS4_CUDA_HAVE_MXF4
+#if defined(DS4_CUDA_HAVE_MXF4) || defined(DS4_CUDA_HAVE_TCGEN05)
         if (g_indexer_mxf4_scratch &&
             g_indexer_mxf4_scratch_device == c->device_id) {
             (void)cudaFree(g_indexer_mxf4_scratch);
@@ -3009,6 +3066,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_device_is_spark = false;
+    g_device_is_thor = false;
+    g_device_platform = DS4_CUDA_PLATFORM_GENERIC;
     g_cublas_ready = 0;
 
     /* Per-device selective cache teardown (selective model cache). */
@@ -14443,7 +14502,11 @@ indexer_scores_rows16_kernel(
 #endif
 }
 
-#ifdef DS4_CUDA_HAVE_MXF4
+/* The MXFP4 encoder and the packed layout it produces are shared by the two
+ * Blackwell block-scaled paths: mma.sync on sm_120a/sm_121a (DS4_CUDA_HAVE_MXF4)
+ * and tcgen05 on sm_110a (DS4_CUDA_HAVE_TCGEN05). Both consume the same row of
+ * 128 E2M1 nibbles plus the four biased E8M0 exponents per 32-element block. */
+#if defined(DS4_CUDA_HAVE_MXF4) || defined(DS4_CUDA_HAVE_TCGEN05)
 #define DS4_MXF4_INDEXER_HEADS 64u
 #define DS4_MXF4_INDEXER_DIM 128u
 
@@ -14459,7 +14522,7 @@ __device__ static inline uint32_t indexer_mxf4_nearest_level(float v) {
 }
 
 /* Encode rows that have already passed the model's E2M1 QAT. The packed
- * exponent word is consumed directly by the SM121 block-scaled MMA. */
+ * exponent word is consumed directly by the Blackwell block-scaled MMA. */
 __global__ static void indexer_mxf4_encode_rows_kernel(
         const float * __restrict__ src,
         unsigned char * __restrict__ codes,
@@ -14510,6 +14573,9 @@ __global__ static void indexer_mxf4_encode_rows_kernel(
     }
 }
 
+#endif /* DS4_CUDA_HAVE_MXF4 || DS4_CUDA_HAVE_TCGEN05: shared MXFP4 encoder */
+
+#ifdef DS4_CUDA_HAVE_MXF4
 __device__ static inline void indexer_mxf4_mma(
         float out[4],
         const uint32_t a[4],
@@ -14732,7 +14798,375 @@ __global__ static void __launch_bounds__(512) indexer_scores_mxf4_kernel(
 }
 #endif
 
-#ifdef DS4_CUDA_HAVE_MXF4
+#ifdef DS4_CUDA_HAVE_TCGEN05
+/* =========================================================================
+ * Jetson Thor (sm_110a): tcgen05 block-scaled MXFP4 light-indexer scorer.
+ *
+ * The sm_121a scorer above feeds the per-warp `mma.sync.kind::mxf4`
+ * instruction, which does not exist on Thor: capability 11.0 reaches the same
+ * E2M1 x E2M1 block-scaled product only through the fifth-generation tensor
+ * core (`tcgen05.mma.kind::mxf4.block_scale.scale_vec::2X`, dense K=64 per
+ * instruction, M=128, N up to 256). This kernel issues that instruction
+ * instead, one 128x128 tile at a time, and keeps the rest of the scorer
+ * identical: the MXFP4 encoder above, the causal mask, the relu dot times
+ * head weight reduction, and the caller's scratch allocation.
+ *
+ * Geometry, all established on hardware:
+ *   A (M side) = 128 components of the column tile, one row each
+ *   B (N side) = 128 (token, head) pairs, row n = token_row * 8 + head
+ *   depth K = 128 = two K=64 instructions accumulated into the same TMEM tile
+ *   SMEM A/B  K-major, no swizzle: 16-byte word w of row r at
+ *             (r/8)*512 + (w/2)*256 + (r%8)*16 + (w%2)*128  (512 B per 8 rows)
+ *   descriptor LBO = 8 (128 B), SBO = 32 (512 B), version = 1
+ *   scale factors  A (per component): (subpartition m/32, lane m%32), col
+ *                  SFA + m/32, byte = k-block; B (per (token, head)):
+ *                  replicated into all four subpartitions
+ *   D  f32, 128 columns; row m of A is lane m%32 of subpartition m/32
+ *   TMEM 256 columns: D [0,128), SFA/SFB for both K-chunks above the D extent
+ *
+ * Putting the components on the M side is what makes the reduction cheap:
+ * thread m reads its own row of D, i.e. all 64 heads of 16 tokens, so the
+ * per-head relu and weight multiply stay in registers and exactly one thread
+ * writes a given score cell. The alternative orientation (heads/tokens on M,
+ * components on N) needs the 8 rows of a token reduced across lanes: that
+ * costs either warp shuffles or a shared-memory race and measured ~1.7x
+ * slower on the module.
+ *
+ * Correctness is covered by tests/test_cuda_indexer_mxfp4.cu, a
+ * double-precision oracle over the same quantization; the warp-level scorer
+ * remains the fallback on any other device and under DS4_CUDA_NO_INDEXER_MXF4.
+ */
+#define DS4_TC5_TILE_COMP 128u
+#define DS4_TC5_TILE_TOKEN 16u
+#define DS4_TC5_HEADS_PER_MMA 8u
+#define DS4_TC5_HEAD_GROUPS (DS4_MXF4_INDEXER_HEADS / DS4_TC5_HEADS_PER_MMA)
+#define DS4_TC5_TMEM_COLS 256u
+/* Column offsets in the 256-column TMEM allocation. D takes [0, 128), so the
+ * scale-factor tiles start above it: anything lower is clobbered by the MMA. */
+#define DS4_TC5_TMEM_D 0u
+#define DS4_TC5_TMEM_SFA0 128u
+#define DS4_TC5_TMEM_SFA1 136u
+#define DS4_TC5_TMEM_SFB0 144u
+#define DS4_TC5_TMEM_SFB1 152u
+
+/* Shared-memory matrix descriptor for the layout staged above: start address
+ * in 16-byte units, LBO = 8 (128 B, the 16-byte word step), SBO = 32 (512 B,
+ * the 8-row core stride), descriptor version 1, no swizzle. `k_byte` selects
+ * the K=64 chunk (0 or 256 bytes). */
+static __device__ __forceinline__ uint64_t indexer_tc5_sdesc(
+        const void *base,
+        uint32_t    k_byte) {
+    return ((uint64_t)(((unsigned)__cvta_generic_to_shared(base)) >> 4) & 0x3FFFu) |
+           (8ull << 16) | (32ull << 32) | (1ull << 46) |
+           (uint64_t)(k_byte >> 4);
+}
+
+static __device__ __forceinline__ void indexer_tc5_mma(
+        uint32_t                  d_tmem,
+        const unsigned char      *a_smem,
+        const unsigned char      *b_smem,
+        uint32_t                  k_byte,
+        uint32_t                  sfa_tmem,
+        uint32_t                  sfb_tmem,
+        uint32_t                  accumulate) {
+    /* Instruction descriptor: A/B format E2M1 (1), N = 128 -> n_dim 16,
+     * E8M0 scale format, M = 128 -> m_dim 8, dense K=64. */
+    const uint32_t idesc =
+        (1u << 7) | (1u << 10) | (16u << 17) | (1u << 23) | (8u << 24);
+    const uint64_t desc_a = indexer_tc5_sdesc(a_smem, k_byte);
+    const uint64_t desc_b = indexer_tc5_sdesc(b_smem, k_byte);
+    asm volatile(
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %6, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X "
+        "[%0], %1, %2, %3, [%4], [%5], p;\n\t}"
+        :: "r"(d_tmem), "l"(desc_a), "l"(desc_b), "r"(idesc),
+           "r"(sfa_tmem), "r"(sfb_tmem), "r"(accumulate));
+}
+
+/* Stage one 64-byte packed E2M1 row into the K-major, no-swizzle layout the
+ * descriptors above address. `dst_base` points at the row's 16-byte slot in
+ * its 8-row core; `word` selects the 16-byte K word, which also picks the K=64
+ * chunk and the 128-byte half within it. An invalid row is zero-filled by
+ * cp.async's src-size argument. */
+static __device__ __forceinline__ void indexer_tc5_cp_row(
+        unsigned char *dst_base,
+        const unsigned char *src,
+        uint32_t word,
+        bool valid) {
+    const uint32_t dst = (uint32_t)__cvta_generic_to_shared(
+        dst_base + (word >> 1u) * 256u + (word & 1u) * 128u);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"(dst), "l"(src), "r"(valid ? 16u : 0u));
+}
+
+__global__ static void __launch_bounds__(128)
+indexer_scores_mxf4_tcgen05_kernel(
+        float *scores,
+        const unsigned char * __restrict__ q_codes,
+        const uint32_t * __restrict__ q_scales,
+        const float * __restrict__ weights,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t ratio,
+        float scale,
+        const unsigned char * __restrict__ k_codes,
+        const uint32_t * __restrict__ k_scales) {
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t tile_t = blockIdx.y * DS4_TC5_TILE_TOKEN;
+    const uint32_t tile_c = blockIdx.x * DS4_TC5_TILE_COMP;
+
+    const uint32_t last_token = min(tile_t + DS4_TC5_TILE_TOKEN, n_tokens);
+    const uint32_t max_visible = last_token > tile_t
+        ? min((pos0 + last_token) / ratio, n_comp) : 0u;
+    if (tile_c >= max_visible) {
+        for (uint32_t i = tid; i < DS4_TC5_TILE_TOKEN * DS4_TC5_TILE_COMP; i += 128u) {
+            const uint32_t token_row = i >> 7u;
+            const uint32_t col = i & 127u;
+            const uint32_t token = tile_t + token_row;
+            const uint32_t comp = tile_c + col;
+            if (token < n_tokens && comp < n_comp) {
+                scores[(uint64_t)token * n_comp + comp] = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    /* A holds the 128 components of this column tile, one row each, and is
+     * staged once per block. B holds the 8 heads x 16 tokens of the current
+     * head group, row n = token_row * 8 + head_in_group, double buffered so
+     * the next group's rows load while this group's MMAs run. With the
+     * components on the M side and the (token, head) pairs on the N side,
+     * every thread owns one component and reads its 128 columns as 16
+     * groups of 8 head values, so the head reduction is a plain register
+     * sum: no shuffles and no shared-memory races. */
+    __shared__ __align__(1024) unsigned char a_smem[DS4_TC5_TILE_COMP * 64u];
+    __shared__ __align__(1024) unsigned char b_smem[2][DS4_TC5_TILE_COMP * 64u];
+    __shared__ float w_smem[DS4_TC5_TILE_TOKEN * DS4_MXF4_INDEXER_HEADS];
+    __shared__ __align__(16) unsigned long long mbar;
+    __shared__ uint32_t tmem_base_smem;
+
+    if (tid == 0) {
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
+                     :: "r"((unsigned)__cvta_generic_to_shared(&mbar)));
+    }
+
+    /* A: the key rows of this column tile. */
+    for (uint32_t i = tid; i < DS4_TC5_TILE_COMP * 4u; i += 128u) {
+        const uint32_t row = i >> 2u;
+        const uint32_t word = i & 3u;
+        const uint32_t comp = tile_c + row;
+        indexer_tc5_cp_row(
+            a_smem + (row >> 3u) * 512u + (row & 7u) * 16u,
+            k_codes + (uint64_t)(comp < n_comp ? comp : 0u) * 64u + word * 16u,
+            word, comp < n_comp);
+    }
+    /* Head weights of this token tile: w_smem[token_row * 64 + head]. */
+    for (uint32_t i = tid; i < DS4_TC5_TILE_TOKEN * DS4_MXF4_INDEXER_HEADS / 4u; i += 128u) {
+        const uint32_t t = i / (DS4_MXF4_INDEXER_HEADS / 4u);
+        const uint32_t wq = i % (DS4_MXF4_INDEXER_HEADS / 4u);
+        const uint32_t token = tile_t + t;
+        const uint32_t dst = (uint32_t)__cvta_generic_to_shared(
+            w_smem + t * DS4_MXF4_INDEXER_HEADS + wq * 4u);
+        const void *src = weights +
+            (uint64_t)(token < n_tokens ? token : 0u) * DS4_MXF4_INDEXER_HEADS +
+            wq * 4u;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                     :: "r"(dst), "l"(src), "r"(token < n_tokens ? 16u : 0u));
+    }
+    auto stage_b = [&](uint32_t group, uint32_t buffer) {
+        for (uint32_t i = tid; i < DS4_TC5_TILE_COMP * 4u; i += 128u) {
+            const uint32_t row = i >> 2u;
+            const uint32_t word = i & 3u;
+            const uint32_t token_row = row >> 3u;
+            const uint32_t head = row & 7u;
+            const uint32_t token = tile_t + token_row;
+            const bool valid = token < n_tokens;
+            const uint64_t qrow = (uint64_t)(valid ? token : 0u) *
+                DS4_MXF4_INDEXER_HEADS + group * DS4_TC5_HEADS_PER_MMA + head;
+            indexer_tc5_cp_row(
+                b_smem[buffer] + (row >> 3u) * 512u + (row & 7u) * 16u,
+                q_codes + qrow * 64u + word * 16u, word, valid);
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+    stage_b(0u, 0u);
+
+    if (warp == 0) {
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;\n"
+                     :: "r"((unsigned)__cvta_generic_to_shared(&tmem_base_smem)),
+                        "n"(DS4_TC5_TMEM_COLS));
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n");
+    }
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+    asm volatile("fence.proxy.async.shared::cta;\n");
+    const uint32_t tmem_base = tmem_base_smem;
+
+    float acc[DS4_TC5_TILE_TOKEN];
+#pragma unroll
+    for (uint32_t i = 0u; i < DS4_TC5_TILE_TOKEN; i++) acc[i] = 0.0f;
+
+    for (uint32_t group = 0u; group < DS4_TC5_HEAD_GROUPS; group++) {
+        const uint32_t buffer = group & 1u;
+        const bool has_next = group + 1u < DS4_TC5_HEAD_GROUPS;
+        if (has_next) {
+            /* wait_group 1 leaves the next group's rows in flight, i.e. this
+             * group's B buffer has arrived. */
+            stage_b(group + 1u, buffer ^ 1u);
+            asm volatile("cp.async.wait_group 1;\n");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n");
+        }
+        __syncthreads();
+        asm volatile("fence.proxy.async.shared::cta;\n");
+
+        /* Scale factors. A row m of A is component tile_c + m and owns its
+         * q_scales/k_scales word; the two K=64 chunks of this MMA read bytes
+         * 0,1 and 2,3 from separate TMEM columns. */
+        {
+            const uint32_t row = warp * 32u + lane;
+            const uint32_t comp = tile_c + row;
+            const uint32_t packed = comp < n_comp ? k_scales[comp] : 0x7f7f7f7fu;
+            asm volatile("tcgen05.st.sync.aligned.32x32b.x1.b32 [%0], {%1};\n"
+                         :: "r"(tmem_base + DS4_TC5_TMEM_SFA0 + warp),
+                            "r"(packed));
+            asm volatile("tcgen05.st.sync.aligned.32x32b.x1.b32 [%0], {%1};\n"
+                         :: "r"(tmem_base + DS4_TC5_TMEM_SFA1 + warp),
+                            "r"(packed >> 16u));
+        }
+        {
+            /* B rows are replicated into all four subpartitions: column group
+             * n/32 holds the 32 (token, head) pairs at lane n%32. */
+            for (uint32_t j = 0u; j < 4u; j++) {
+                const uint32_t n = j * 32u + lane;
+                const uint32_t token = tile_t + (n >> 3u);
+                const uint32_t head = group * DS4_TC5_HEADS_PER_MMA + (n & 7u);
+                const uint32_t packed = token < n_tokens
+                    ? q_scales[(uint64_t)token * DS4_MXF4_INDEXER_HEADS + head]
+                    : 0x7f7f7f7fu;
+                asm volatile("tcgen05.st.sync.aligned.32x32b.x1.b32 [%0], {%1};\n"
+                             :: "r"(tmem_base + DS4_TC5_TMEM_SFB0 + j),
+                                "r"(packed));
+                asm volatile("tcgen05.st.sync.aligned.32x32b.x1.b32 [%0], {%1};\n"
+                             :: "r"(tmem_base + DS4_TC5_TMEM_SFB1 + j),
+                                "r"(packed >> 16u));
+            }
+        }
+        asm volatile("tcgen05.wait::st.sync.aligned;\n");
+        asm volatile("tcgen05.fence::before_thread_sync;\n");
+        __syncthreads();
+        asm volatile("tcgen05.fence::after_thread_sync;\n");
+
+        if (tid == 0) {
+            indexer_tc5_mma(tmem_base + DS4_TC5_TMEM_D,
+                            a_smem, b_smem[buffer], 0u,
+                            tmem_base + DS4_TC5_TMEM_SFA0,
+                            tmem_base + DS4_TC5_TMEM_SFB0, 0u);
+            indexer_tc5_mma(tmem_base + DS4_TC5_TMEM_D,
+                            a_smem, b_smem[buffer], 256u,
+                            tmem_base + DS4_TC5_TMEM_SFA1,
+                            tmem_base + DS4_TC5_TMEM_SFB1, 1u);
+            asm volatile(
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one."
+                "shared::cluster.b64 [%0];\n"
+                :: "r"((unsigned)__cvta_generic_to_shared(&mbar)));
+        }
+        {
+            const uint32_t mb = (unsigned)__cvta_generic_to_shared(&mbar);
+            asm volatile("{\n\t.reg .pred p;\n\t"
+                         "TC5WAIT:\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
+                         "@!p bra TC5WAIT;\n\t}"
+                         :: "r"(mb), "r"(group & 1u));
+        }
+        __syncthreads();
+        asm volatile("tcgen05.fence::after_thread_sync;\n");
+
+        /* Epilogue: this thread owns component tile_c + warp*32 + lane and
+         * reads its 128 columns as 4 chunks of 32 = 4 tokens x 8 heads. The
+         * tcgen05.ld is warp-wide, so it runs for every thread including the
+         * ones past the end of the component or token range. */
+        {
+            const uint32_t row = warp * 32u + lane;
+            const uint32_t comp = tile_c + row;
+            const bool comp_valid = comp < n_comp;
+            /* Two x32 loads per wait: the epilogue is bound by the TMEM read
+             * bandwidth (measured ~1.2 TB/s on the module, with x32, x64 and
+             * x128 all reaching the same ceiling), not by the multiply-adds,
+             * so all that matters here is keeping loads in flight. */
+#pragma unroll
+            for (uint32_t chunk = 0u; chunk < DS4_TC5_TILE_COMP / 64u; chunk++) {
+                float d[2][32];
+#pragma unroll
+                for (uint32_t half = 0u; half < 2u; half++) {
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32 "
+                        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
+                        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31},"
+                        " [%32];\n"
+                        : "=f"(d[half][0]), "=f"(d[half][1]), "=f"(d[half][2]), "=f"(d[half][3]),
+                          "=f"(d[half][4]), "=f"(d[half][5]), "=f"(d[half][6]), "=f"(d[half][7]),
+                          "=f"(d[half][8]), "=f"(d[half][9]), "=f"(d[half][10]), "=f"(d[half][11]),
+                          "=f"(d[half][12]), "=f"(d[half][13]), "=f"(d[half][14]), "=f"(d[half][15]),
+                          "=f"(d[half][16]), "=f"(d[half][17]), "=f"(d[half][18]), "=f"(d[half][19]),
+                          "=f"(d[half][20]), "=f"(d[half][21]), "=f"(d[half][22]), "=f"(d[half][23]),
+                          "=f"(d[half][24]), "=f"(d[half][25]), "=f"(d[half][26]), "=f"(d[half][27]),
+                          "=f"(d[half][28]), "=f"(d[half][29]), "=f"(d[half][30]), "=f"(d[half][31])
+                        : "r"(tmem_base + DS4_TC5_TMEM_D + chunk * 64u + half * 32u));
+                }
+                asm volatile("tcgen05.wait::ld.sync.aligned;\n");
+                if (comp_valid) {
+#pragma unroll
+                    for (uint32_t half = 0u; half < 2u; half++) {
+                        const uint32_t token_base = chunk * 8u + half * 4u;
+#pragma unroll
+                        for (uint32_t q = 0u; q < 4u; q++) {
+                            /* The 8 heads of a token are 8 consecutive D
+                             * columns, so this reduction is register-local. */
+                            const float *wrow = &w_smem[(token_base + q) *
+                                DS4_MXF4_INDEXER_HEADS +
+                                group * DS4_TC5_HEADS_PER_MMA];
+                            float sum = 0.0f;
+#pragma unroll
+                            for (uint32_t hh = 0u; hh < 8u; hh++) {
+                                sum += fmaxf(d[half][q * 8u + hh], 0.0f) * wrow[hh];
+                            }
+                            acc[token_base + q] += sum;
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        asm volatile("tcgen05.fence::after_thread_sync;\n");
+    }
+
+    if (warp == 0) {
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;\n"
+                     :: "r"(tmem_base), "n"(DS4_TC5_TMEM_COLS));
+    }
+
+    {
+        const uint32_t comp = tile_c + warp * 32u + lane;
+        if (comp < n_comp) {
+#pragma unroll
+            for (uint32_t token_row = 0u; token_row < DS4_TC5_TILE_TOKEN; token_row++) {
+                const uint32_t token = tile_t + token_row;
+                if (token >= n_tokens) continue;
+                const uint32_t visible = (pos0 + token + 1u) / ratio;
+                scores[(uint64_t)token * n_comp + comp] = comp >= visible
+                    ? -INFINITY
+                    : acc[token_row] * scale;
+            }
+        }
+    }
+}
+
+#endif /* DS4_CUDA_HAVE_TCGEN05 */
+
+#if defined(DS4_CUDA_HAVE_MXF4) || defined(DS4_CUDA_HAVE_TCGEN05)
 static void *indexer_mxf4_scratch_alloc(uint64_t bytes) {
     if (g_indexer_mxf4_scratch_bytes >= bytes) {
         return g_indexer_mxf4_scratch;
@@ -14764,8 +15198,10 @@ static void *indexer_mxf4_scratch_alloc(uint64_t bytes) {
 }
 #endif
 
-/* Return 1 when the SM121 path handled the call, 0 to use the established
- * scorer, and -1 on a launch failure. */
+/* Return 1 when a Blackwell block-scaled MXFP4 path handled the call, 0 to
+ * use the established scorer, and -1 on a launch failure. The SM121 mma.sync
+ * scorer and the Thor tcgen05 scorer consume the same encoded rows and
+ * scratch layout, so only the final launch differs by platform. */
 static int indexer_scores_mxf4_try(
         ds4_gpu_tensor *scores,
         const ds4_gpu_tensor *q,
@@ -14778,7 +15214,7 @@ static int indexer_scores_mxf4_try(
         uint32_t head_dim,
         uint32_t ratio,
         float scale) {
-#ifndef DS4_CUDA_HAVE_MXF4
+#if !defined(DS4_CUDA_HAVE_MXF4) && !defined(DS4_CUDA_HAVE_TCGEN05)
     (void)scores; (void)q; (void)weights; (void)index_comp;
     (void)n_comp; (void)n_tokens; (void)pos0; (void)n_head;
     (void)head_dim; (void)ratio; (void)scale;
@@ -14829,6 +15265,28 @@ static int indexer_scores_mxf4_try(
         return -1;
     }
 
+#ifdef DS4_CUDA_HAVE_TCGEN05
+    /* tcgen05 needs the actual capability, not just the platform flag: a
+     * forced DS4_CUDA_PLATFORM=thor on another GPU must fall through. */
+    int cc_major = 0;
+    if (ds4_gpu_device_is_thor() &&
+        cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor,
+                               ds4_tensor_device_idx(scores)) == cudaSuccess &&
+        cc_major == 11) {
+        dim3 tc5_grid((n_comp + DS4_TC5_TILE_COMP - 1u) / DS4_TC5_TILE_COMP,
+                      (n_tokens + DS4_TC5_TILE_TOKEN - 1u) / DS4_TC5_TILE_TOKEN,
+                      1u);
+        indexer_scores_mxf4_tcgen05_kernel<<<tc5_grid, 128>>>(
+            (float *)scores->ptr, q_codes, q_scales,
+            (const float *)weights->ptr, n_comp, n_tokens, pos0, ratio,
+            scale, k_codes, k_scales);
+        if (!cuda_ok(cudaGetLastError(), "indexer mxf4 tcgen05 score launch")) {
+            return -1;
+        }
+        return 1;
+    }
+#endif
+#ifdef DS4_CUDA_HAVE_MXF4
     dim3 grid((n_comp + 255u) / 256u,
               (n_tokens + 15u) / 16u, 1u);
     indexer_scores_mxf4_kernel<<<grid, 512>>>(
@@ -14839,6 +15297,8 @@ static int indexer_scores_mxf4_try(
         return -1;
     }
     return 1;
+#endif
+    return 0;
 #endif
 }
 

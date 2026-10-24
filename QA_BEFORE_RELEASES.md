@@ -986,6 +986,36 @@ Do not use high-performance Hugging Face Xet mode while a model is resident.
 - Verify that any CUDA-only warning fixes are also clean on macOS and do not
   change Metal behavior.
 
+### Jetson Thor (`sm_110a`)
+
+Thor is the second Blackwell target. It is capability 11.0, so it needs its own
+build (`make cuda-thor`) and it cannot run a `make cuda-spark` binary. Build
+and run gates:
+
+- `make clean && make cuda-thor` with no compiler warnings, on the module.
+  Record the CUDA toolkit version: `sm_110a` plus tcgen05 needs CUDA 13 or
+  newer.
+- Confirm the startup banner names the platform and the compiled-in kernel
+  set (`ds4: CUDA platform: Jetson Thor, tcgen05 kernels compiled in`). A
+  build without `DS4_CUDA_HAVE_TCGEN05` must say so and stay on the generic
+  paths.
+- `make test-cuda-indexer-mxfp4`: 20 shapes against the double-precision
+  quantized oracle, with every other indexer arm disabled so a dispatch miss
+  fails. Run it under Compute Sanitizer memcheck/racecheck when the tcgen05
+  staging, descriptors or epilogue change. `make test-cuda-indexer` must keep
+  passing: it covers the fp16 WMMA arm and the small-batch dispatch.
+- `./tests/test_cuda_indexer_mxfp4 --bench` must keep the MXFP4 arm faster
+  than the fp16 scorer on the prefill-shaped rows (32..2048 tokens). Report
+  clocks and any other resident service: this module ramps clocks and the
+  first measurement after idle is slower.
+- Run one resident Flash Q2 CLI prompt and `tests/test_deepseek_indexer` as in
+  the Spark section. There are no Thor whole-model speed baselines yet; record
+  what you measure and say it is new, do not reuse Spark numbers.
+- Confirm that a `cuda-spark` binary refuses to run ("no kernel image") and
+  that `DS4_CUDA_PLATFORM=spark` can force the Spark classification for a
+  Spark-kernel experiment without making the tcgen05 dispatch launch on a
+  non-11.0 device.
+
 ## 9. ROCm / Strix Halo
 
 Use the Strix Halo Framework Desktop via the VPN hostname `strixhalo`

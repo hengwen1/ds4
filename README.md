@@ -92,6 +92,7 @@ and hardware-specific setups:
 | --- | --- |
 | [Metal on Apple Silicon](docs/METAL.md) | `make` |
 | [DGX Spark](docs/DGX_SPARK.md) | `make cuda-spark` |
+| [Jetson Thor](docs/DGX_THOR.md) | `make cuda-thor` |
 | [Strix Halo / Framework Desktop](docs/STRIX_HALO.md) | `make strix-halo` |
 | [One or more CUDA cards, including Ada/L40S](docs/CUDA_MULTI_GPU.md) | `make cuda-generic` |
 

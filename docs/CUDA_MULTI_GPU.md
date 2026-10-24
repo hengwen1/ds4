@@ -19,7 +19,9 @@ make cuda-generic
 make cuda CUDA_ARCH=sm_89
 ```
 
-For a GB10 machine use the [DGX Spark](DGX_SPARK.md) target instead.
+For a GB10 machine use the [DGX Spark](DGX_SPARK.md) target instead, and
+for a Jetson Thor module use the [Thor](DGX_THOR.md) target. Both are
+architecture-specific Blackwell builds (`sm_121a` and `sm_110a`).
 
 ## Normal layer placement
 

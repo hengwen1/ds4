@@ -2754,6 +2754,9 @@ int ds4_gpu_dspark_gfx1151_fast_path(void);
 void ds4_gpu_set_dspark_verify_mode(bool enabled);
 #elif !defined(__APPLE__)
 int ds4_gpu_device_is_spark(void);
+/* Jetson Thor (capability 11.0, sm_110a). The platform the tcgen05 kernel
+ * paths in this file are written for; 0 on every other GPU. */
+int ds4_gpu_device_is_thor(void);
 /* Spark: the spans as batched launches on the decode stream, ordered like
  * the asynchronous tensor copies.  Returns 1 when queued; 0 when declined
  * without copying anything (another device, more than

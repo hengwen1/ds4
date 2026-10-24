@@ -66,6 +66,7 @@
 /tests/test_cuda_hc_pre
 /tests/test_cuda_indexed_one
 /tests/test_cuda_indexer
+/tests/test_cuda_indexer_mxfp4
 /tests/test_cuda_mxfp4_split
 /tests/test_cuda_pool
 /tests/test_cuda_q8_0_gemv

@@ -30,6 +30,17 @@ make tests/test_session_state_gpu tests/test_glm53_kda tests/test_mxfp4_metal
 that it fits before running it; do not accidentally load a large model on a
 single device during multi-GPU QA. ROCm has `make test-rocm`.
 
+On CUDA (both Blackwell targets, `sm_121a` and `sm_110a`), the block-scaled
+MXFP4 indexer scorer has a model-free test that checks the encoded E2M1/UE8M0
+numerics against a double-precision oracle and fails if the MXFP4 arm is not
+the one that answered:
+
+```sh
+make test-cuda-indexer-mxfp4            # correctness
+./tests/test_cuda_indexer_mxfp4 --bench # interleaved MXFP4 vs fp16 WMMA timing
+make test-cuda-indexer                  # every indexer dispatch arm
+```
+
 Official-vector tests must use continuations from the same checkpoint as the
 GGUF. Flash 0731 and Vision Experimental are not interchangeable fixtures.
 See [test vectors](../tests/test-vectors/README.md) and

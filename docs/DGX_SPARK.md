@@ -16,6 +16,8 @@ make cuda-spark
 
 The build targets GB10 (`sm_121a`) and enables the Blackwell-specific kernels.
 Do not use `--cuda-tensor-parallel` on a single Spark.
+For a Jetson Thor module use the [Thor guide](DGX_THOR.md) instead: it is a
+different target (`sm_110a`) and a `cuda-spark` binary does not run there.
 Stop other inference services before loading a model so they do not compete
 for memory. Restore any services you stopped when finished.
 
