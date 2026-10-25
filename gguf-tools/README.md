@@ -322,6 +322,108 @@ This reads only the payloads needed for that tensor.  Add `--compare-gguf
 DeepSeek-V4-Flash-DSpark-support-0731.gguf` to byte-compare against an existing
 support GGUF.
 
+## Convert GLM-5.3 Flash
+
+GLM-5.3 Flash (`glm5-next`, `Glm5NextForConditionalGeneration`) is converted by
+`glm53_quantize.py` from an FP8 Hugging Face snapshot in which every quantized
+weight is paired with an `*_scale_inv` tensor of F32 block scales.  It needs
+NumPy and the local quantizer library:
+
+```sh
+make -C gguf-tools
+```
+
+Three artifacts share one converter:
+
+| `--artifact` | Approximate size | Routed experts |
+| --- | ---: | --- |
+| `q4` | 173 GiB | Q4_K gate, up and down |
+| `q2` | 90 GiB | IQ2_XXS gate/up, Q2_K down |
+| `fp8` | 305 GiB | original FP8 codes plus scales, no requantization |
+
+Check the snapshot before converting anything.  The manifest reads shard headers
+only and validates the 46-layer, 288-expert layout and every FP8 scale:
+
+```sh
+python3 gguf-tools/glm53_manifest.py /path/to/GLM-5.3-Flash-FP8
+```
+
+It reports `missing_shards=0` and matching present and declared byte counts
+for a complete download.  A partial or interrupted download fails here rather
+than in the middle of a write.
+
+Build the Q4 file:
+
+```sh
+python3 gguf-tools/glm53_quantize.py \
+  --hf /path/to/GLM-5.3-Flash-FP8 \
+  --tokenizer-template gguf/GLM-5.3-Flash-Q2.gguf \
+  --artifact q4 \
+  --source-revision 84c6a6aa9497188e15a635ba793b0f95a79b1033 \
+  --threads 24 \
+  --out gguf/GLM-5.3-Flash-Q4_K.gguf
+```
+
+Drop `--out` and add `--dry-run` to print the planned tensor count, types and
+byte totals without writing.  Omit `--source-revision` only when converting the
+pinned official checkpoint; it is recorded as `general.source.revision` and
+should name the revision actually read.  `--threads N` controls routed-expert
+workers.  The converter writes `<out>.partial` beside a per-tensor resume
+journal, publishes with `os.replace`, and refuses an existing output unless you
+pass `--overwrite`; use `--resume` to continue an interrupted conversion.  It
+also refuses to start unless the output volume has the full file size plus a
+32 GiB reserve free.  A full conversion reads about 306 GiB and took 19 minutes
+on a 32-core Mac with the checkpoint on an external NVMe volume.
+
+Add `--imatrix FILE` to guide Q4_K scale selection, or to supply real column
+importance for the Q2 recipe.  Without it the Q2 recipe falls back to the
+weight-energy heuristic described [below](#when-no-imatrix-is-given), so Q2
+outputs are not byte-identical to the published release.
+
+### Tokenizer Templates
+
+`--tokenizer-template` supplies the `tokenizer.*` GGUF records; the converter
+copies no tensor bytes from it and takes `tokenizer.chat_template` from the
+snapshot instead.  Its token list must match the snapshot `tokenizer.json` at
+every one of the 154,880 ids, which the converter checks before writing.
+Because only the header is read, the first 32 MiB of a released GLM-5.3 Flash
+GGUF is a sufficient template and avoids a 90 GiB download:
+
+```sh
+curl -sL -r 0-33554431 \
+  https://huggingface.co/antirez/glm-5.3-flash-gguf/resolve/main/GLM-5.3-Flash-Q2.gguf \
+  -o /tmp/glm53-tokenizer-head.gguf
+```
+
+A complete GGUF works the same way.  Third-party GLM-5.3 derivatives usually
+carry the same vocab, but the check is exact, so expect a failure at a specific
+token id if a template was rebuilt from a different tokenizer.
+
+### Audit The Result
+
+```sh
+python3 gguf-tools/glm53_validate_gguf.py \
+  --hf /path/to/GLM-5.3-Flash-FP8 \
+  --gguf gguf/GLM-5.3-Flash-Q4_K.gguf \
+  --artifact q4 \
+  --source-revision 84c6a6aa9497188e15a635ba793b0f95a79b1033
+```
+
+This rebuilds the plan and checks the tensor set, shapes, types, offsets and
+metadata.  Pass `--verify-payload` to compare every tensor payload byte for
+byte; that mode applies only to the lossless `fp8` artifact.  Layout checks do
+not replace [inference quality tests](quality-testing/README.md).
+
+### Other GLM Converters
+
+- `glm53_full_quantize.py` builds the asymmetric Q2 for the 79-layer, 256-expert
+  full GLM-5.3 checkpoint and needs the full model on disk.
+- `glm53_vision.py --out` creates, and `--validate` checks, the standalone
+  vision encoder GGUF loaded at runtime with `--vision`.
+
+Runtime requirements for these files, including the two-Mac tensor-parallel and
+SSD-streaming layouts, are in [docs/MODELS.md](../docs/MODELS.md).
+
 ## When No Imatrix Is Given
 
 `iq2_xxs` requires an importance vector.  If `--imatrix` is not provided and
