@@ -73178,7 +73178,12 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
 
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
     (void)e;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return DS4_N_EMBD;
+    /* GLM 5.3 keeps its N_HC hyper-connection branches in the residual stream,
+     * so a layer slice carries N_HC * N_EMBD floats per token.  GLM 5.2 has no
+     * hyper-connection stack (n_hc == 0) and stays at N_EMBD. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && DS4_N_HC == 0) {
+        return DS4_N_EMBD;
+    }
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
 }
 
@@ -75918,7 +75923,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
-        const uint64_t hidden_dim = DS4_N_EMBD;
+        const uint64_t hidden_dim = ds4_engine_hidden_f32_values(e);
 #ifdef DS4_ROCM_BUILD
         const bool rocm_layer_slice_token_decode =
             glm_graph_env_truthy(
